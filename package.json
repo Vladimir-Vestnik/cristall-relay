@@ -1,0 +1,20 @@
+{
+  "name": "cristall-relay",
+  "version": "1.0.0",
+  "description": "Cristall P2P Relay Server для GitHub Codespaces",
+  "main": "relay-server.cjs",
+  "scripts": {
+    "start": "node relay-server.cjs",
+    "dev": "node relay-server.cjs"
+  },
+  "keywords": ["p2p", "websocket", "relay"],
+  "author": "Cristall Team",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
