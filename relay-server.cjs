@@ -7,7 +7,7 @@ async function main() {
   
   const relayNode = new CristallP2PNode({
     port: PORT,
-    isRelay: true
+    isRelayServer: true
   });
 
   await relayNode.start();
@@ -50,4 +50,5 @@ main().catch(err => {
   console.error('❌ Ошибка запуска relay:', err);
   process.exit(1);
 });
+
 
