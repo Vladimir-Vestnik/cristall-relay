@@ -66,6 +66,9 @@ class CristallP2PNode extends EventEmitter {
     this.reconnectInterval = options.reconnectInterval || 5000;
     this.maxReconnectAttempts = options.maxReconnectAttempts ?? 3;
     this.heartbeatInterval = options.heartbeatInterval || 30000;
+    /** На relay: сколько интервалов без pong считаем peer «зависшим». */
+    this.heartbeatMissTolerance = options.heartbeatMissTolerance ?? 2;
+    this._heartbeatTimer = null;
 
     // Метрики трафика
     this.trafficMetrics = {
@@ -190,30 +193,10 @@ class CristallP2PNode extends EventEmitter {
           }
         }
 
-        // ✅ ИСПРАВЛЕНИЕ: Проверяем readyState вместо сравнения объектов WebSocket
-        // Обновляем ws в памяти ТОЛЬКО если старый канал мёртв
         const saved = this.peers.get(peerId);
-        if (!saved || saved.ws.readyState !== WebSocket.OPEN) {
-          // Если нет сохранённого peer или старый канал закрыт - обновляем
-          if (saved && saved.ws.readyState !== WebSocket.OPEN) {
-            console.log('[P2P] 🔁 Старый WebSocket для', peerId, 'не активен, обновляем');
-            try { saved.ws.terminate(); } catch {}
-          }
-          
-          const connectionType = inferConnectionTypeFromAddress(peerAddress);
-          this.peers.set(peerId, {
-            ws,
-            address: peerAddress,
-            metadata: message.metadata || {},
-            connectionType
-          });
-          
-          // Отправляем ACK только если мы обновили peer
-          // yourRemoteAddress — IP клиента, как его видит relay (для Cristall.ved: объявить в presence)
+
+        if (saved && saved.ws === ws) {
           const yourRemoteAddress = address || null;
-          if (this.isRelayServer && yourRemoteAddress) {
-            console.log(`[P2P] [RELAY] Handshake от nodeId=${peerId}, IP клиента (remoteAddress)=${yourRemoteAddress} → в handshake_ack yourRemoteAddress=${yourRemoteAddress}`);
-          }
           const ack = JSON.stringify({
             type: 'handshake_ack',
             nodeId: this.nodeId,
@@ -222,14 +205,51 @@ class CristallP2PNode extends EventEmitter {
           });
           ws.send(ack);
           this.recordOutgoing(ack);
-
-          console.log('[P2P] ✅ Handshake выполнен с', peerId, ', address=', peerAddress);
-          this.emit('peer:connected', { peerId, address: peerAddress });
-        } else {
-          // Старый канал жив - закрываем новый ws (дубликат), не заменяем
-          console.log('[P2P] ⚠️ WebSocket для', peerId, 'уже активен, закрываем дубликат');
-          try { ws.close(1000, 'Duplicate connection'); } catch {}
+          console.log('[P2P] ✅ Повторный handshake на том же сокете:', peerId);
+          return;
         }
+
+        if (saved && saved.ws !== ws) {
+          if (saved.ws.readyState === WebSocket.OPEN) {
+            if (this.isRelayServer) {
+              console.log('[P2P] [RELAY] 🔁 Замена прежнего WebSocket для', peerId, 'новым handshake (reconnect)');
+              try { saved.ws.close(1000, 'Superseded by reconnect'); } catch {}
+              try { saved.ws.terminate(); } catch {}
+            } else {
+              console.log('[P2P] ⚠️ WebSocket для', peerId, 'уже активен, закрываем дубликат');
+              try { ws.close(1000, 'Duplicate connection'); } catch {}
+              return;
+            }
+          } else {
+            console.log('[P2P] 🔁 Старый WebSocket для', peerId, 'не активен, обновляем');
+            try { saved.ws.terminate(); } catch {}
+          }
+        }
+
+        const connectionType = inferConnectionTypeFromAddress(peerAddress);
+        this.peers.set(peerId, {
+          ws,
+          address: peerAddress,
+          metadata: message.metadata || {},
+          connectionType,
+          lastPongAt: Date.now()
+        });
+
+        const yourRemoteAddress = address || null;
+        if (this.isRelayServer && yourRemoteAddress) {
+          console.log(`[P2P] [RELAY] Handshake от nodeId=${peerId}, IP клиента (remoteAddress)=${yourRemoteAddress} → в handshake_ack yourRemoteAddress=${yourRemoteAddress}`);
+        }
+        const ack = JSON.stringify({
+          type: 'handshake_ack',
+          nodeId: this.nodeId,
+          metadata: this.getNodeMetadata(),
+          yourRemoteAddress
+        });
+        ws.send(ack);
+        this.recordOutgoing(ack);
+
+        console.log('[P2P] ✅ Handshake выполнен с', peerId, ', address=', peerAddress);
+        this.emit('peer:connected', { peerId, address: peerAddress });
         return;
       }
 
@@ -587,6 +607,13 @@ class CristallP2PNode extends EventEmitter {
       case 'ping':
         this.sendToPeer(fromPeerId, { type: 'pong', timestamp: Date.now() });
         break;
+
+      case 'pong':
+        if (fromPeerId) {
+          const peer = this.peers.get(fromPeerId);
+          if (peer) peer.lastPongAt = Date.now();
+        }
+        break;
         
       case 'peer_discovery':
         // Отправляем список известных узлов
@@ -931,12 +958,24 @@ class CristallP2PNode extends EventEmitter {
    * Heartbeat - проверка живости соединений
    */
   startHeartbeat() {
-    setInterval(() => {
-      this.peers.forEach((peer, peerId) => {
-        if (peer.ws.readyState === WebSocket.OPEN) {
-          this.sendToPeer(peerId, { type: 'ping' });
+    if (this._heartbeatTimer) return;
+    const staleMs = this.heartbeatInterval * this.heartbeatMissTolerance;
+    this._heartbeatTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [peerId, peer] of [...this.peers.entries()]) {
+        if (!peer.ws || peer.ws.readyState !== WebSocket.OPEN) continue;
+
+        const lastPongAt = peer.lastPongAt || 0;
+        if (this.isRelayServer && lastPongAt > 0 && now - lastPongAt > staleMs) {
+          console.log(`[P2P] [RELAY] Heartbeat timeout для ${peerId}, удаляем зависший peer (${Math.round((now - lastPongAt) / 1000)}с без pong)`);
+          try { peer.ws.terminate(); } catch {}
+          this.peers.delete(peerId);
+          this.emit('peer:disconnected', { peerId });
+          continue;
         }
-      });
+
+        this.sendToPeer(peerId, { type: 'ping', timestamp: now });
+      }
     }, this.heartbeatInterval);
   }
   
@@ -982,6 +1021,11 @@ class CristallP2PNode extends EventEmitter {
    */
   async stop() {
     console.log('[P2P] 🛑 Остановка узла...');
+
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
     
     // ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Останавливаем автопереподключение ДО закрытия соединений
     this.autoReconnectTargets.clear();
@@ -1141,4 +1185,3 @@ class CristallP2PNode extends EventEmitter {
 }
 
 module.exports = { CristallP2PNode };
-
